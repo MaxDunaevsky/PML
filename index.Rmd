@@ -1,0 +1,209 @@
+---
+title: "Quality of training - Practical ML course project"
+author: "Max Dunaevsky"
+date: "5/19/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+# Data preparation
+## Loading libraries
+```{r echo = TRUE}
+library(ggplot2)
+library(lattice)
+library(caret)
+library(rpart)
+library(rpart.plot)
+library(randomForest)
+library(data.table)
+library(e1071)
+library (xgboost)
+library(gbm)
+library(C50)
+```
+
+## Loading data
+```{r echo = TRUE}
+url_to_train_set <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+url_to_test_set <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+
+train_set_init <- fread(url_to_train_set)
+test_set <- fread(url_to_test_set)
+```
+
+## Splitting out train and validation dataset(to asses expected out of sample error)
+```{r echo = TRUE}
+set.seed(777)
+inTrain <- createDataPartition(y=train_set_init$classe, p=0.6, list=FALSE)
+train_set <- train_set_init[inTrain, ]
+validation_set <- train_set_init[-inTrain, ]
+```
+
+## Eliminating variables with near zero variance
+Will orient on variance in test set because many obs from that set have only NAs.
+```{r echo = TRUE}
+myDataNZV <- nearZeroVar(test_set, saveMetrics=FALSE, names = TRUE)
+```
+More than 100 such vars. Using this variables won't be helpful in prediction.
+
+## Selecting features to use
+```{r echo = TRUE}
+selected_columns <- setdiff(names(train_set),myDataNZV)
+train_set <- train_set[,..selected_columns]
+```
+## Inputting mean values instead of NAs so as not to lose some useful information in data
+```{r echo = TRUE}
+for (i in names(train_set)){
+  train_set[,(i) := ifelse(is.na(get(i)),mean(get(i),na.rm = TRUE),get(i))] 
+}
+```
+## Classes distribution. 
+There is no extremely large skewness in classes distribution therefore will use accuracy as our main metric when training models.
+```{r echo = TRUE}
+percentage <- prop.table(table(train_set$classe))*100
+cbind(freq = table(train_set$classe), percentage = percentage)
+barchart(percentage, xlab = "% of cases", main = "Distribution of classes")
+```
+
+## Multicolinearity check
+Removing vars that could cause sporadic correlation but in fact is not at all logically related to classe value.
+```{r echo = TRUE}
+meaningful_columns <- setdiff(names(train_set), c("V1", "user_name", "cvtd_timestamp", "raw_timestamp_part_1", "raw_timestamp_part_2"))
+train_set <- train_set[,..meaningful_columns]
+```
+Determining highly correlated variables.
+```{r echo = TRUE}
+cor_selected_columns <- setdiff(names(train_set), "classe")
+correlations <- cor(train_set[,..cor_selected_columns])
+highlyCorrelated <- findCorrelation(correlations, cutoff = 0.7)
+high_cor_columns_to_exclude <- cor_selected_columns[highlyCorrelated]
+```
+Following columns will be excluded from further analysis.
+```{r echo = TRUE}
+high_cor_columns_to_exclude
+```
+Excluding highly correlated columns
+```{r echo = TRUE}
+selected_cols_after_cor <- setdiff(names(train_set),high_cor_columns_to_exclude)
+train_set <- train_set[, ..selected_cols_after_cor]
+```
+## PCA analysis
+Shows that we really need not so much vars to capture 80% of variables' variance
+```{r echo = TRUE}
+procTrain <- preProcess(train_set, method = "pca", thresh = 0.8 )
+procTrain
+```
+## Same data preprocessing with validation dataset
+```{r echo = TRUE}
+validation_set <- validation_set[,..selected_cols_after_cor]
+for (i in names(validation_set)){
+  validation_set[,(i) := ifelse(is.na(get(i)),mean(get(i),na.rm = TRUE),get(i))] 
+}
+```
+# Building models
+First of all let's build simple tree model to get understanding of possible levels of accuracy and have some nice visual representation explaining why model predicts one or other value.
+```{r echo = TRUE}
+set.seed(777)
+d_tree_model <- rpart(classe ~ ., data = train_set, method = "class")
+prp(d_tree_model)
+```
+
+## Estimating expected out of sample error
+For this basic model accuracy is lower than - 80%.
+```{r echo = TRUE}
+pred_valid_set <- predict(d_tree_model, validation_set, type = "class")
+confusionMatrix(pred_valid_set, as.factor(validation_set$classe))
+```
+## Using caret package to train a set of models
+Settings for accuracy oriented optimization.
+Also setting crossvalidation as our train method.
+```{r echo = TRUE}
+metric <- "Accuracy"
+trainControl <- trainControl(method="cv", number=3)
+```
+
+LDA model:
+```{r echo = TRUE}
+set.seed(777)
+fit.lda <- train(classe ~ ., data = train_set, method = "lda", 
+                 metric = metric, trControl = trainControl)
+```
+CART model:
+```{r echo = TRUE}
+set.seed(777)
+fit.cart <- train(classe ~ ., data = train_set, method = "rpart", 
+                  metric = metric, trControl = trainControl)
+```
+Random Forest model:
+```{r echo = TRUE}
+set.seed(777)
+fit.rf <- train(classe ~ ., data = train_set, method = "rf", 
+                metric = metric, trControl = trainControl)
+```
+Stochastic Gradient Boosting model:
+```{r echo = TRUE}
+set.seed(777)
+fit.gbm <- train(classe ~ ., data = train_set, method = "gbm", 
+                 metric = metric, trControl = trainControl, verbose = FALSE,
+                 preProcess = c("center", "scale"))
+```
+C5.0 model:
+```{r echo = TRUE}
+set.seed(777)
+fit.c50 <- train(classe ~ ., data = train_set, method="C5.0", metric=metric,
+                 trControl=trainControl)
+```
+XGBoost model:
+Here also setting some tuning params from results of previous runs.
+```{r echo = TRUE}
+grid <- expand.grid(
+  .nrounds = 150,
+  .max_depth = 3,
+  .eta=0.3,
+  .gamma = 0,
+  .colsample_bytree=c(0.8),
+  .min_child_weight = 1,
+  .subsample =1)
+fit.xgboost <- train(classe ~ ., data = train_set, method="xgbTree", metric=metric, trControl=trainControl, tuneGrid = grid)
+```
+
+# Comparing models
+XGBoost model seems to be most promising one given almost 100% accuracy.
+```{r echo = TRUE}
+results = resamples(list(CART = fit.cart, LDA = fit.lda, RF = fit.rf, GBM = fit.gbm,
+                         XGBoost = fit.xgboost, C50 = fit.c50))
+summary(results)
+```
+
+# Estimating expected out of sample error of selected XGBoost model
+As we see even out of sample error is quite low which is a great news.
+```{r echo = TRUE}
+pred_valid_set <- predict(fit.xgboost, validation_set, type = "raw")
+confusionMatrix(pred_valid_set, as.factor(validation_set$classe))
+```
+
+# Prediction on test set
+## Preprocessing data like train_set
+```{r echo = TRUE}
+test_selected_columns <- setdiff(names(train_set), "classe")
+test_set <- test_set[,..test_selected_columns]
+for (i in names(test_set)){
+  test_set[,(i) := ifelse(is.na(get(i)),mean(get(i),na.rm = TRUE),get(i))] 
+}
+```
+
+## Prediction itself
+```{r echo = TRUE}
+pred_test_set <- predict(fit.xgboost, test_set, type = "raw")
+```
+
+
+
+
+
+
+
+
